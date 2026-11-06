@@ -1,4 +1,52 @@
-# DoorbellTuya
+# DoorbellTuya — experimental session lifecycle fork
+
+This personal fork of **nihatds100/DoorbellTuya** changes the behavior described
+in the original documentation below. Read the [audit](docs/session-analysis.md).
+It is a development version, not a hardware-validated fix or a stable HACS release.
+
+- HA registers and exposes **HD only, on demand**. No permanent SD reader or
+  periodic video probe runs. Avoid camera preloading and live dashboard cards.
+- Only one quality can own a camera session in this bridge. Multiple viewers
+  share that quality through go2rtc. This cannot limit other Tuya apps or portals.
+- A fatal camera-session error closes clients and blocks new Tuya sessions until
+  **the integration is reloaded manually**. Local RTSP retries may continue, but
+  cannot create another camera session. This intentionally replaces self-healing.
+- Normal last-viewer departure closes the source after five seconds. HA or an NVR
+  may itself retain a viewer longer; closure begins when its RTSP client leaves.
+- Private fallback ports: API `127.0.0.1:31984`, RTSP `38554`, WebRTC `38555`.
+
+The development code and rebuilt Linux binaries are on `fix/session-lifecycle`.
+Do not install only the Python files: the Go executables contain the cleanup fix.
+No configuration or software on the real HA instance has been changed by this
+source audit. Hardware validation remains required.
+
+## Validate and rebuild this fork
+
+Run `python -m unittest discover -s tests` from the repository root. From
+`bridge-src`, run:
+
+```sh
+go test -timeout=30s ./...
+go vet ./...
+# Supported Linux host with a C compiler:
+go test -race ./...
+CGO_ENABLED=0 GOOS=linux GOARCH=amd64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o ../custom_components/tuya_doorbell_rtsp/bin/tuya-ipc-terminal-linux-amd64 .
+CGO_ENABLED=0 GOOS=linux GOARCH=arm64 go build -trimpath -buildvcs=false -ldflags="-s -w" -o ../custom_components/tuya_doorbell_rtsp/bin/tuya-ipc-terminal-linux-arm64 .
+```
+
+Tests use synthetic sessions and do not contact Tuya or a camera. For a manual
+development install, back up the existing integration, replace its
+`custom_components/tuya_doorbell_rtsp` directory with this branch's complete
+directory and restart HA. Keep credentials and runtime data out of Git. Do not
+run two copies. Existing SD entities may remain unavailable in HA's registry.
+
+Original license and attribution are retained. This fork remains for personal,
+noncommercial use. The following is the **original upstream documentation**;
+its always-warm, HD+SD and automatic-recovery claims do not apply to this branch.
+
+---
+
+# DoorbellTuya (upstream)
 
 **Local, always-warm RTSP from a Tuya / Smart Life video doorbell — for Home Assistant.**
 

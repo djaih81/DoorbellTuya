@@ -4,6 +4,7 @@ import (
 	"encoding/json"
 	"errors"
 	"fmt"
+	"sync"
 	"time"
 	"tuya-ipc-terminal/pkg/core"
 	"tuya-ipc-terminal/pkg/utils"
@@ -12,6 +13,7 @@ import (
 )
 
 type MQTTClient struct {
+	mutex          sync.RWMutex
 	mqtt           mqtt.Client
 	uid            string
 	subscribeTopic string
@@ -63,7 +65,7 @@ func NewMqttClient(clientId, mobileMqttsUrl string, mqttConfig *MQTConfig) (*MQT
 	// opts.SetDefaultPublishHandler(messageHandler)
 	opts.SetOnConnectHandler(client.onConnect)
 	opts.SetConnectionLostHandler(client.onDisconnect)
-	opts.SetAutoReconnect(true)
+	opts.SetAutoReconnect(false) // A failed camera session must be explicitly reloaded.
 	opts.SetConnectTimeout(10 * time.Second)
 	opts.SetKeepAlive(60 * time.Second)
 	opts.SetCleanSession(true)
@@ -76,14 +78,24 @@ func NewMqttClient(clientId, mobileMqttsUrl string, mqttConfig *MQTConfig) (*MQT
 	return client, nil
 }
 
+func (c *MQTTClient) isClosed() bool {
+	c.mutex.RLock()
+	defer c.mutex.RUnlock()
+	return c.closed
+}
+
 func (c *MQTTClient) Stop() {
+	c.mutex.Lock()
+	c.closed = true
+	c.mutex.Unlock()
 	if c.mqtt != nil {
 		c.mqtt.Disconnect(250)
-		c.closed = true
 	}
 }
 
 func (c *MQTTClient) AddCameraClient(sessionId string, cameraClient *MQTTCameraClient) {
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	if c.cameras == nil {
 		c.cameras = make(map[string]*MQTTCameraClient)
 	}
@@ -91,9 +103,8 @@ func (c *MQTTClient) AddCameraClient(sessionId string, cameraClient *MQTTCameraC
 }
 
 func (c *MQTTClient) RemoveCameraClient(sessionId string) {
-	if c.cameras == nil {
-		return
-	}
+	c.mutex.Lock()
+	defer c.mutex.Unlock()
 	delete(c.cameras, sessionId)
 }
 
@@ -111,13 +122,20 @@ func (c *MQTTClient) onConnect(client mqtt.Client) {
 }
 
 func (c *MQTTClient) onDisconnect(client mqtt.Client, err error) {
-	if err != nil {
-		c.Connected.Done(err)
-	} else {
-		c.Connected.Done(errors.New("mqtt client disconnected"))
+	if err == nil {
+		err = errors.New("mqtt client disconnected")
 	}
-
+	c.Connected.Done(err)
+	c.mutex.Lock()
 	c.closed = true
+	cameras := make([]*MQTTCameraClient, 0, len(c.cameras))
+	for _, camera := range c.cameras {
+		cameras = append(cameras, camera)
+	}
+	c.mutex.Unlock()
+	for _, camera := range cameras {
+		camera.onError(err)
+	}
 }
 
 func (c *MQTTClient) consume(client mqtt.Client, msg mqtt.Message) {
@@ -128,7 +146,9 @@ func (c *MQTTClient) consume(client mqtt.Client, msg mqtt.Message) {
 	}
 
 	sessionId := rmqtt.Data.Header.SessionID
+	c.mutex.RLock()
 	cameraClient, ok := c.cameras[sessionId]
+	c.mutex.RUnlock()
 	if !ok {
 		core.Logger.Warn().Msgf("No camera client found for sessionId: %s", sessionId)
 		return

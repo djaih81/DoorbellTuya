@@ -14,7 +14,6 @@ from .const import (
     CONF_RTSP_PORT, DEFAULT_RTSP_PORT, DOMAIN, EVENT_DP, LOCAL_PROTOCOL_VERSION,
 )
 from . import go2rtc as g2
-from . import health as hm
 from .dp import TuyaDPMonitor
 from .event import signal
 
@@ -48,30 +47,21 @@ async def async_setup_entry(hass, entry):
     # ever has ONE client (go2rtc), which fans out to viewers/NVR/app reliably.
     g2mgr = g2.Go2rtc(hass, Path(__file__).parent / "bin")
     go2rtc_ok = False
-    health_monitors = []
     if await g2mgr.async_start():
         cams = {c["deviceId"]: c for c in bridge.list_cameras()}
         go2rtc_ok = True
         for dev_id in d.get(CONF_CAMERAS, []):
             cam = cams.get(dev_id)
-            if cam and not await g2mgr.async_register(bridge.port, cam["rtspPath"], dev_id, force=True):
+            if cam and not await g2mgr.async_register(bridge.port, cam["rtspPath"], dev_id, qualities=("hd",), force=True):
                 go2rtc_ok = False
         _LOGGER.info("tuya_doorbell_rtsp: go2rtc routing %s", "enabled" if go2rtc_ok else "partial")
-        # Bulletproof: a permanent, self-healing health monitor per camera keeps one
-        # hot session and repairs any zombie/stuck source before a viewer notices.
-        for dev_id in d.get(CONF_CAMERAS, []):
-            cam = cams.get(dev_id)
-            if cam:
-                mon = hm.HealthMonitor(hass, g2mgr, bridge, dev_id, cam["rtspPath"])
-                mon.start()
-                health_monitors.append(mon)
-        _LOGGER.info("tuya_doorbell_rtsp: %d health monitor(s) started (always-warm + self-heal)", len(health_monitors))
+        _LOGGER.info("Camera streams are on demand; no permanent preview or health probe")
     else:
         _LOGGER.warning("tuya_doorbell_rtsp: go2rtc unavailable; using direct bridge URLs (less warm-reliable)")
 
     hass.data.setdefault(DOMAIN, {})[entry.entry_id] = {
         "bridge": bridge, "details": details, "monitors": monitors,
-        "go2rtc": g2mgr, "go2rtc_ok": go2rtc_ok, "health": health_monitors,
+        "go2rtc": g2mgr, "go2rtc_ok": go2rtc_ok,
     }
     _LOGGER.warning("tuya_doorbell_rtsp: %d DP monitor(s) from %d detail(s)", len(monitors), len(details))
     for mon in monitors:
@@ -95,17 +85,17 @@ def _make_monitor(hass, entry, device_id, local_key):
 
 async def async_unload_entry(hass, entry):
     ok = await hass.config_entries.async_unload_platforms(entry, PLATFORMS)
+    if not ok:
+        return False
     store = hass.data.get(DOMAIN, {}).pop(entry.entry_id, None)
     if store:
         for mon in store.get("monitors", []):
             mon.stop()
-        for mon in store.get("health", []):
-            await mon.async_stop()
+        mgr = store.get("go2rtc")
+        if mgr:
+            await mgr.async_stop()
         bridge = store.get("bridge")
         if bridge:
             await bridge.async_stop_keepwarm()
             await bridge.async_stop()
-        mgr = store.get("go2rtc")
-        if mgr:
-            await mgr.async_stop()
     return ok

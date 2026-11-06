@@ -184,7 +184,7 @@ func (c *MQTTCameraClient) onError(err error) {
 }
 
 func (c *MQTTCameraClient) sendMqttMessage(messageType string, protocol int, transactionID string, data interface{}) error {
-	if c.mqttClient.closed {
+	if c.mqttClient.isClosed() {
 		return errors.New("mqtt client is closed, send mqtt message fail")
 	}
 
@@ -218,7 +218,10 @@ func (c *MQTTCameraClient) sendMqttMessage(messageType string, protocol int, tra
 	}
 
 	token := c.mqttClient.mqtt.Publish(c.publishTopic, 1, false, payload)
-	if token.Wait() && token.Error() != nil {
+	if !token.WaitTimeout(2 * time.Second) {
+		return errors.New("MQTT publish timed out")
+	}
+	if token.Error() != nil {
 		core.Logger.Error().Err(token.Error()).Msgf("Send mqtt message error")
 		return token.Error()
 	}

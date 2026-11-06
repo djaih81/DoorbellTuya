@@ -1,76 +1,74 @@
-// (c) go2rtc
-
+// (c) go2rtc; lifecycle fixes in the downstream fork.
 package utils
 
-import (
-	"sync"
-)
+import "sync"
 
-// Waiter support:
-// - autotart on first Wait
-// - block new waiters after last Done
-// - safe Done after finish
 type Waiter struct {
-	sync.WaitGroup
-	mu    sync.Mutex
-	state int // state < 0 means finish
-	err   error
+	mu       sync.Mutex
+	pending  int
+	finished bool
+	err      error
+	done     chan struct{}
+}
+
+func (w *Waiter) init() {
+	if w.done == nil {
+		w.done = make(chan struct{})
+	}
 }
 
 func (w *Waiter) Add(delta int) {
 	w.mu.Lock()
-	if w.state >= 0 {
-		w.state += delta
-		w.WaitGroup.Add(delta)
+	defer w.mu.Unlock()
+	if w.finished {
+		return
 	}
-	w.mu.Unlock()
+	w.init()
+	if w.pending+delta < 0 {
+		panic("negative Waiter count")
+	}
+	w.pending += delta
 }
 
 func (w *Waiter) Wait() error {
 	w.mu.Lock()
-	// first wait auto start waiter
-	if w.state == 0 {
-		w.state++
-		w.WaitGroup.Add(1)
-	}
+	w.init()
+	done := w.done
 	w.mu.Unlock()
-
-	w.WaitGroup.Wait()
-
+	<-done
+	w.mu.Lock()
+	defer w.mu.Unlock()
 	return w.err
 }
 
 func (w *Waiter) Done(err error) {
 	w.mu.Lock()
-
-	// safe run Done only when have tasks
-	if w.state > 0 {
-		w.state--
-		w.WaitGroup.Done()
+	defer w.mu.Unlock()
+	if w.finished {
+		return
 	}
-
-	// block waiter for any operations after last done
-	if w.state == 0 {
-		w.state = -1
+	w.init()
+	if w.pending > 0 {
+		w.pending--
+	}
+	if w.pending == 0 {
 		w.err = err
+		w.finished = true
+		close(w.done)
 	}
-
-	w.mu.Unlock()
 }
 
 func (w *Waiter) WaitChan() <-chan error {
-	var ch chan error
-
+	ch := make(chan error, 1)
 	w.mu.Lock()
-
-	if w.state >= 0 {
-		ch = make(chan error)
-		go func() {
-			ch <- w.Wait()
-		}()
+	w.init()
+	if w.finished {
+		ch <- w.err
+		close(ch)
+		w.mu.Unlock()
+		return ch
 	}
-
 	w.mu.Unlock()
-
+	go func() { ch <- w.Wait(); close(ch) }()
 	return ch
 }

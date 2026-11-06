@@ -27,9 +27,9 @@ _ARCH_MAP = {"aarch64": "arm64", "arm64": "arm64", "x86_64": "amd64", "amd64": "
 _HA_API = "http://127.0.0.1:1984"
 _HA_RTSP = 8554
 # Our bundled instance (used only when HA's go2rtc is absent).
-_OWN_API = "http://127.0.0.1:11984"
-_OWN_RTSP = 18554
-_OWN_WEBRTC = 18555
+_OWN_API = "http://127.0.0.1:31984"
+_OWN_RTSP = 38554
+_OWN_WEBRTC = 38555
 
 
 def stream_name(device_id: str, quality: str) -> str:
@@ -55,6 +55,7 @@ class Go2rtc:
         self._proc = None
         self._api = None
         self._rtsp_port = None
+        self._registered: set[str] = set()
 
     @property
     def available(self) -> bool:
@@ -95,7 +96,7 @@ class Go2rtc:
         cfg = self._data / "go2rtc.yaml"
         cfg.write_text(
             "log:\n  level: warn\n"
-            f"api:\n  listen: \"127.0.0.1:11984\"\n"
+            f"api:\n  listen: \"127.0.0.1:31984\"\n"
             f"rtsp:\n  listen: \":{_OWN_RTSP}\"\n"
             f"webrtc:\n  listen: \":{_OWN_WEBRTC}\"\n"
         )
@@ -118,7 +119,7 @@ class Go2rtc:
         _LOGGER.error("tuya_doorbell_rtsp: bundled go2rtc did not come up")
         return False
 
-    async def async_register(self, bridge_port, rtsp_path, device_id, qualities=("hd", "sd"), force=False) -> bool:
+    async def async_register(self, bridge_port, rtsp_path, device_id, qualities=("hd",), force=False) -> bool:
         """(Re)register hd+sd streams for one camera via the go2rtc API."""
         if not self.available:
             return False
@@ -141,17 +142,34 @@ class Go2rtc:
                     if resp.status not in (200, 201):
                         _LOGGER.warning("tuya_doorbell_rtsp: go2rtc register %s -> HTTP %s", name, resp.status)
                         ok = False
+                    else:
+                        self._registered.add(name)
             except Exception as err:  # noqa: BLE001
                 _LOGGER.warning("tuya_doorbell_rtsp: go2rtc register %s failed: %s", name, err)
                 ok = False
         return ok
 
     async def async_stop(self):
-        """Stop our bundled go2rtc (never touches HA's)."""
+        """Remove only our streams, then stop our private process if any."""
+        if self._api and self._registered:
+            session = async_get_clientsession(self._hass)
+            for name in tuple(self._registered):
+                try:
+                    async with session.delete(
+                        f"{self._api}/api/streams?name={quote(name, safe='')}", timeout=_T
+                    ) as resp:
+                        if resp.status not in (200, 404):
+                            _LOGGER.warning("Could not unregister camera stream %s: HTTP %s", name, resp.status)
+                except Exception as err:
+                    _LOGGER.warning("Could not unregister camera stream %s: %s", name, err)
+            self._registered.clear()
         if self._proc is not None and self._proc.returncode is None:
             self._proc.terminate()
             try:
                 await asyncio.wait_for(self._proc.wait(), 5)
             except Exception:  # noqa: BLE001
                 self._proc.kill()
+                await self._proc.wait()
         self._proc = None
+        self._api = None
+        self._rtsp_port = None

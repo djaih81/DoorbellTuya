@@ -21,7 +21,7 @@ async def async_setup_entry(hass, entry, async_add_entities):
         cam = cams.get(dev_id)
         if not cam:
             continue
-        for quality in ("hd", "sd"):
+        for quality in ("hd",):
             entities.append(TuyaDoorbellCamera(cam, quality, bridge.port, mgr))
     async_add_entities(entities)
 

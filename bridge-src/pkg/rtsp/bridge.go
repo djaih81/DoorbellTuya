@@ -6,10 +6,10 @@ import (
 	"errors"
 	"fmt"
 	"io"
-	"os"
 	"net/http"
 	"net/http/cookiejar"
 	"net/url"
+	"os"
 	"regexp"
 	"strings"
 	"sync"
@@ -47,6 +47,9 @@ type WebRTCBridge struct {
 	connected bool
 	waiter    utils.Waiter
 	mutex     sync.RWMutex
+	lifecycle sync.Mutex
+	stopOnce  sync.Once
+	errorOnce sync.Once
 
 	// Context for cancellation
 	ctx    context.Context
@@ -83,11 +86,21 @@ func NewWebRTCBridge(camera *storage.CameraInfo, streamResolution string, user *
 	return wb
 }
 
-func (wb *WebRTCBridge) Start() error {
-	wb.mutex.Lock()
-	defer wb.mutex.Unlock()
-
-	if wb.connected {
+func (wb *WebRTCBridge) Start() (err error) {
+	wb.lifecycle.Lock()
+	defer func() {
+		wb.lifecycle.Unlock()
+		if err != nil {
+			wb.Stop()
+		}
+	}()
+	if wb.ctx.Err() != nil {
+		return wb.ctx.Err()
+	}
+	if wb.user == nil || wb.user.SessionData == nil {
+		return errors.New("missing user session")
+	}
+	if wb.IsConnected() {
 		return errors.New("bridge already connected")
 	}
 
@@ -162,11 +175,18 @@ func (wb *WebRTCBridge) Start() error {
 		if werr != nil {
 			return fmt.Errorf("failed to establish connection: %v", werr)
 		}
+	case <-wb.ctx.Done():
+		return wb.ctx.Err()
 	case <-time.After(30 * time.Second):
 		return fmt.Errorf("failed to establish connection: timeout (device may be holding a stuck session)")
 	}
 
+	if wb.ctx.Err() != nil {
+		return wb.ctx.Err()
+	}
+	wb.mutex.Lock()
 	wb.connected = true
+	wb.mutex.Unlock()
 	core.Logger.Info().Msgf("WebRTC bridge started successfully for camera: %s", wb.camera.DeviceName)
 
 	// Periodically request keyframes so a viewer joining the (warm) stream starts
@@ -191,74 +211,39 @@ func (wb *WebRTCBridge) Start() error {
 	return nil
 }
 
+// Stop releases partially initialized and remotely disconnected sessions too.
+// Cancel before waiting for Start so an in-flight handshake can terminate.
 func (wb *WebRTCBridge) Stop() {
-	wb.mutex.Lock()
-	defer wb.mutex.Unlock()
-
-	if !wb.connected {
-		return
-	}
-
-	wb.connected = false
-
-	core.Logger.Info().Msgf("Stopping WebRTC bridge for camera: %s", wb.camera.DeviceName)
-
-	// Clean close: tell the camera to end its WebRTC session FIRST and give the
-	// MQTT message time to be delivered BEFORE we cancel the context / close MQTT,
-	// so the device releases its single WebRTC session instead of leaving it stuck.
-	if wb.cameraClient != nil {
-		wb.cameraClient.SendDisconnect()
-		time.Sleep(500 * time.Millisecond)
-	}
-
-	// Cancel context to stop all goroutines
 	wb.cancel()
-
-	// Close peer connection
-	if wb.peerConnection != nil {
-		wb.peerConnection.Close()
-	}
-
-	// Stop MQTT client
-	if wb.mqttClient != nil {
-		wb.mqttClient.Stop()
-	}
-
-	// Stop RTP forwarder
-	if wb.rtpForwarder != nil {
-		wb.rtpForwarder.Stop()
-	}
-
-	core.Logger.Info().Msgf("WebRTC bridge stopped for camera: %s", wb.camera.DeviceName)
+	wb.waiter.Done(context.Canceled)
+	wb.lifecycle.Lock()
+	defer wb.lifecycle.Unlock()
+	wb.stopOnce.Do(func() {
+		wb.mutex.Lock()
+		wb.connected = false
+		wb.mutex.Unlock()
+		if wb.cameraClient != nil {
+			if err := wb.cameraClient.SendDisconnect(); err != nil {
+				core.Logger.Warn().Err(err).Msg("Could not signal camera disconnect")
+			}
+			if wb.mqttClient != nil {
+				wb.mqttClient.RemoveCameraClient(wb.cameraClient.SessionId)
+			}
+		}
+		if wb.peerConnection != nil {
+			_ = wb.peerConnection.Close()
+		}
+		if wb.mqttClient != nil {
+			wb.mqttClient.Stop()
+		}
+		if wb.rtpForwarder != nil {
+			wb.rtpForwarder.Stop()
+		}
+		core.Logger.Info().Msgf("WebRTC bridge resources released for camera: %s", wb.camera.DeviceName)
+	})
 }
 
-func (wb *WebRTCBridge) ForceStop() {
-	wb.mutex.Lock()
-	defer wb.mutex.Unlock()
-
-	wb.connected = false
-
-	core.Logger.Info().Msgf("Force-stopping WebRTC bridge (clearing stuck session) for camera: %s", wb.camera.DeviceName)
-
-	// Tell the device to release its (possibly stuck) WebRTC session, then give
-	// the MQTT message time to be delivered before we tear everything down.
-	if wb.cameraClient != nil {
-		wb.cameraClient.SendDisconnect()
-		time.Sleep(1500 * time.Millisecond)
-	}
-	if wb.cancel != nil {
-		wb.cancel()
-	}
-	if wb.peerConnection != nil {
-		wb.peerConnection.Close()
-	}
-	if wb.mqttClient != nil {
-		wb.mqttClient.Stop()
-	}
-	if wb.rtpForwarder != nil {
-		wb.rtpForwarder.Stop()
-	}
-}
+func (wb *WebRTCBridge) ForceStop() { wb.Stop() }
 
 func (wb *WebRTCBridge) IsConnected() bool {
 	wb.mutex.RLock()
@@ -267,8 +252,11 @@ func (wb *WebRTCBridge) IsConnected() bool {
 }
 
 func (wb *WebRTCBridge) ForwardBackchannelAudioPacket(packet *rtp.Packet) {
-	if wb.backchannel != nil {
-		_ = wb.backchannel.WriteRTP(packet)
+	wb.mutex.RLock()
+	track := wb.backchannel
+	wb.mutex.RUnlock()
+	if track != nil {
+		_ = track.WriteRTP(packet)
 	}
 }
 
@@ -410,13 +398,17 @@ func (wb *WebRTCBridge) setupPeerConnection(webRTCConfig *tuya.WebRTCConfig) err
 		core.Logger.Trace().Msgf("Received track: %s, PayloadType: %d", codec.MimeType, codec.PayloadType)
 
 		if track.Kind() == pion.RTPCodecTypeVideo {
+			wb.mutex.Lock()
 			wb.videoTrack = track
+			wb.mutex.Unlock()
 
 			if !wb.isHEVC {
 				go wb.handleVideoTrack(track)
 			}
 		} else if track.Kind() == pion.RTPCodecTypeAudio {
+			wb.mutex.Lock()
 			wb.audioTrack = track
+			wb.mutex.Unlock()
 
 			for _, tr := range wb.peerConnection.GetTransceivers() {
 				if tr.Receiver() == receiver && tr.Kind() == pion.RTPCodecTypeAudio {
@@ -426,7 +418,9 @@ func (wb *WebRTCBridge) setupPeerConnection(webRTCConfig *tuya.WebRTCConfig) err
 							"audio-backchannel", "pion",
 						)
 						tr.Sender().ReplaceTrack(localTrack)
+						wb.mutex.Lock()
 						wb.backchannel = localTrack
+						wb.mutex.Unlock()
 						core.Logger.Trace().Msgf("Setup backchannel track")
 						break
 					}
@@ -511,18 +505,20 @@ func (wb *WebRTCBridge) setupMQTTCameraClient(webRTCConfig *tuya.WebRTCConfig) {
 
 	wb.cameraClient.HandleDisconnect = func() {
 		wb.handleError(errors.New("camera client disconnected"))
-		wb.connected = false
 	}
 }
 
 // RequestKeyframe asks the camera (WebRTC sender) for an immediate IDR via RTCP PLI,
 // so newly-joined RTSP clients start within ~1s instead of waiting for the next GOP.
 func (wb *WebRTCBridge) RequestKeyframe() {
-	if wb.videoTrack == nil || wb.peerConnection == nil {
+	wb.mutex.RLock()
+	track := wb.videoTrack
+	wb.mutex.RUnlock()
+	if track == nil || wb.peerConnection == nil {
 		return
 	}
 	_ = wb.peerConnection.WriteRTCP([]rtcp.Packet{
-		&rtcp.PictureLossIndication{MediaSSRC: uint32(wb.videoTrack.SSRC())},
+		&rtcp.PictureLossIndication{MediaSSRC: uint32(track.SSRC())},
 	})
 }
 
@@ -708,8 +704,18 @@ func (wb *WebRTCBridge) sendMessageToDataChannel(message []byte) error {
 }
 
 func (wb *WebRTCBridge) handleError(err error) {
-	if wb.OnError != nil {
+	if wb.ctx.Err() != nil {
+		return
+	} // Normal local teardown is not a failure.
+	wb.errorOnce.Do(func() {
 		wb.waiter.Done(err)
-		wb.OnError(err)
-	}
+		wb.cancel()
+		// Pion/MQTT callbacks must return before their transports are closed.
+		go func() {
+			if wb.OnError != nil {
+				wb.OnError(err)
+			}
+			wb.Stop()
+		}()
+	})
 }

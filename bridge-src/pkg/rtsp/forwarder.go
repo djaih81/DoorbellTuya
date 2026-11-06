@@ -260,8 +260,8 @@ func (rf *RTPForwarder) RemoveClient(sessionID string) {
 }
 
 func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
-	rf.mutex.RLock()
-	defer rf.mutex.RUnlock()
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 
 	if len(rf.clients) == 0 {
 		return
@@ -305,8 +305,8 @@ func (rf *RTPForwarder) ForwardVideoPacket(packet *rtp.Packet) {
 }
 
 func (rf *RTPForwarder) ForwardAudioPacket(packet *rtp.Packet) {
-	rf.mutex.RLock()
-	defer rf.mutex.RUnlock()
+	rf.mutex.Lock()
+	defer rf.mutex.Unlock()
 
 	if len(rf.clients) == 0 {
 		return
@@ -350,20 +350,15 @@ func (rf *RTPForwarder) ForwardAudioPacket(packet *rtp.Packet) {
 }
 
 func (rf *RTPForwarder) Stop() {
-	// Reset SSRCs
-	rf.videoSSRC = 0
-	rf.audioSSRC = 1
-
-	// Reset first packet flags
-	rf.firstVideoPacket = true
-	rf.firstAudioPacket = true
-
-	// Clear all clients
-	for sessionID := range rf.clients {
-		rf.RemoveClient(sessionID)
+	rf.mutex.Lock()
+	sessions := make([]string, 0, len(rf.clients))
+	for id := range rf.clients {
+		sessions = append(sessions, id)
 	}
-
-	core.Logger.Trace().Msg("RTPForwarder stopped and all clients cleared")
+	rf.mutex.Unlock()
+	for _, id := range sessions {
+		rf.RemoveClient(id)
+	}
 }
 
 func (rf *RTPForwarder) GetClientCount() int {
