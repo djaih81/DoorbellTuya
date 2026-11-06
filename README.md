@@ -14,6 +14,11 @@ It is a development version, not a hardware-validated fix or a stable HACS relea
 - Normal last-viewer departure closes the source after five seconds. HA or an NVR
   may itself retain a viewer longer; closure begins when its RTSP client leaves.
 - Private fallback ports: API `127.0.0.1:31984`, RTSP `38554`, WebRTC `38555`.
+- A **Sonnette** event entity recognizes new `initiative_message` reports with
+  `cmd: ipc_doorbell` from HA's existing Tuya integration. Cached startup messages
+  and duplicate deliveries are ignored. This requires the same device to be
+  configured in native Tuya; it creates no extra device or video connection.
+  Encrypted image data and keys are not exposed in the event attributes.
 
 The development code and rebuilt Linux binaries are on `fix/session-lifecycle`.
 Do not install only the Python files: the Go executables contain the cleanup fix.

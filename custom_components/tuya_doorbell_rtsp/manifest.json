@@ -16,5 +16,8 @@
   "requirements": [
     "tinytuya==1.20.0"
   ],
-  "version": "0.1.4.dev1"
+  "version": "0.1.4.dev2",
+  "after_dependencies": [
+    "tuya"
+  ]
 }
